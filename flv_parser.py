@@ -1,677 +1,573 @@
 import struct
 import os
+import sys # 导入 sys 模块
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, IO
+from collections import Counter
+import subprocess
+from datetime import datetime
+
+# --- AMF0 Parsing Utilities ---
+
+def _read_ui8(f: IO[bytes]) -> int:
+    return struct.unpack('>B', f.read(1))[0]
+
+def _read_ui16(f: IO[bytes]) -> int:
+    return struct.unpack('>H', f.read(2))[0]
+
+def _read_double(f: IO[bytes]) -> float:
+    return struct.unpack('>d', f.read(8))[0]
+
+def _parse_amf_string(f: IO[bytes]) -> str:
+    length = _read_ui16(f)
+    return f.read(length).decode('utf-8', errors='replace')
+
+def _parse_amf_value(f: IO[bytes], type_marker: Optional[int] = None) -> Any:
+    if type_marker is None:
+        type_marker = _read_ui8(f)
+    
+    if type_marker == 0:  # Number
+        return _read_double(f)
+    elif type_marker == 1:  # Boolean
+        return _read_ui8(f) != 0
+    elif type_marker == 2:  # String
+        return _parse_amf_string(f)
+    elif type_marker == 3:  # Object
+        obj = {}
+        while True:
+            try:
+                key = _parse_amf_string(f)
+                if not key: break # End of object
+                value_type = _read_ui8(f)
+                if value_type == 9: break # Object End Marker
+                obj[key] = _parse_amf_value(f, value_type)
+            except (struct.error, IndexError):
+                break # Reached end of data
+        return obj
+    elif type_marker == 8:  # ECMA Array
+        count = struct.unpack('>I', f.read(4))[0]
+        arr = {}
+        for _ in range(count):
+            key = _parse_amf_string(f)
+            value = _parse_amf_value(f)
+            arr[key] = value
+        # Read object end marker (a string of length 0 and a type marker 9)
+        f.read(3)
+        return arr
+    elif type_marker == 10: # Strict Array
+        count = struct.unpack('>I', f.read(4))[0]
+        arr = []
+        for _ in range(count):
+            arr.append(_parse_amf_value(f))
+        return arr
+    else:
+        return f"Unsupported AMF Type: {type_marker}"
+
+class BitReader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.byte_pos = 0
+        self.bit_pos = 0
+
+    def read(self, num_bits: int) -> int:
+        value = 0
+        while num_bits > 0:
+            if self.byte_pos >= len(self.data):
+                raise ValueError("Reading past end of data")
+            current_byte = self.data[self.byte_pos]
+            bits_to_read = min(num_bits, 8 - self.bit_pos)
+            mask = ((1 << bits_to_read) - 1) << (8 - self.bit_pos - bits_to_read)
+            bits = (current_byte & mask) >> (8 - self.bit_pos - bits_to_read)
+            value = (value << bits_to_read) | bits
+            self.bit_pos += bits_to_read
+            num_bits -= bits_to_read
+            if self.bit_pos == 8:
+                self.bit_pos = 0
+                self.byte_pos += 1
+        return value
+
+AAC_AUDIO_OBJECT_TYPES = {
+    1: "AAC Main", 2: "AAC LC", 3: "AAC SSR", 4: "AAC LTP", 5: "SBR", 6: "AAC Scalable"
+}
+AAC_SAMPLING_FREQUENCIES = {
+    0: "96000 Hz", 1: "88200 Hz", 2: "64000 Hz", 3: "48000 Hz", 4: "44100 Hz",
+    5: "32000 Hz", 6: "24000 Hz", 7: "22050 Hz", 8: "16000 Hz", 9: "12000 Hz",
+    10: "11025 Hz", 11: "8000 Hz", 12: "7350 Hz"
+}
+AAC_CHANNEL_CONFIGURATIONS = {
+    1: "1 channel: C", 2: "2 channels: L, R", 3: "3 channels: C, L, R",
+    4: "4 channels: C, L, R, B", 5: "5 channels: C, L, R, SL, SR",
+    6: "6 channels: C, L, R, SL, SR, LFE", 7: "8 channels: C, L, R, SL, SR, BL, BR, LFE"
+}
 
 class FLVTag:
-    """FLV标签类，用于存储和解析FLV文件中的标签信息"""
-    
-    # 标签类型常量
-    AUDIO = 8
-    VIDEO = 9
-    SCRIPT = 18
-    
-    # 标签类型名称映射
-    TAG_TYPES = {
-        AUDIO: "Audio",
-        VIDEO: "Video",
-        SCRIPT: "Script Data"
-    }
-    
-    # 音频格式映射
+    AUDIO, VIDEO, SCRIPT = 8, 9, 18
+    TAG_TYPES = {AUDIO: "Audio", VIDEO: "Video", SCRIPT: "Script Data"}
     AUDIO_FORMATS = {
-        0: "Linear PCM, platform endian",
-        1: "ADPCM",
-        2: "MP3",
-        3: "Linear PCM, little endian",
-        4: "Nellymoser 16kHz mono",
-        5: "Nellymoser 8kHz mono",
-        6: "Nellymoser",
-        7: "G.711 A-law logarithmic PCM",
-        8: "G.711 mu-law logarithmic PCM",
-        9: "reserved",
-        10: "AAC",
-        11: "Speex",
-        14: "MP3 8kHz",
-        15: "Device-specific sound"
+        0: "LPCM", 1: "ADPCM", 2: "MP3", 3: "LPCM LE", 4: "Nellymoser 16kHz",
+        5: "Nellymoser 8kHz", 6: "Nellymoser", 7: "G.711 A-law", 8: "G.711 mu-law",
+        9: "reserved", 10: "AAC", 11: "Speex", 14: "MP3 8kHz", 15: "Device-specific"
     }
-    
-    # 音频采样率映射
-    AUDIO_RATES = {
-        0: "5.5kHz",
-        1: "11kHz",
-        2: "22kHz",
-        3: "44kHz"
-    }
-    
-    # 音频位深度映射
-    AUDIO_BITS = {
-        0: "8-bit",
-        1: "16-bit"
-    }
-    
-    # 音频通道映射
-    AUDIO_CHANNELS = {
-        0: "Mono",
-        1: "Stereo"
-    }
-    
-    # 视频帧类型映射
+    AUDIO_RATES = {0: "5.5kHz", 1: "11kHz", 2: "22kHz", 3: "44kHz"}
+    AUDIO_BITS = {0: "8-bit", 1: "16-bit"}
+    AUDIO_CHANNELS = {0: "Mono", 1: "Stereo"}
     VIDEO_FRAME_TYPES = {
-        1: "Key frame",
-        2: "Inter frame",
-        3: "Disposable inter frame",
-        4: "Generated key frame",
-        5: "Video info/command frame"
+        1: "Key frame", 2: "Inter frame", 3: "Disposable inter frame",
+        4: "Generated key frame", 5: "Video info/command frame"
     }
-    
-    # 视频编码映射
     VIDEO_CODECS = {
-        1: "JPEG",
-        2: "Sorenson H.263",
-        3: "Screen video",
-        4: "On2 VP6",
-        5: "On2 VP6 with alpha channel",
-        6: "Screen video version 2",
-        7: "AVC (H.264)"
+        2: "Sorenson H.263", 3: "Screen video", 4: "On2 VP6",
+        5: "On2 VP6 with alpha", 6: "Screen video v2", 7: "AVC (H.264)"
     }
-    
-    def __init__(self, offset: int, data: bytes):
-        """初始化FLV标签
-        
-        Args:
-            offset: 标签在文件中的偏移量
-            data: 标签数据
-        """
+
+    def __init__(self, offset: int, data: bytes, global_metadata: Dict[str, Any]):
         self.offset = offset
         self.tag_type = data[0]
         self.data_size = (data[1] << 16) | (data[2] << 8) | data[3]
         self.timestamp = (data[4] << 16) | (data[5] << 8) | data[6] | (data[7] << 24)
         self.stream_id = (data[8] << 16) | (data[9] << 8) | data[10]
         self.data = data[11:11+self.data_size]
-        self.total_size = 11 + self.data_size + 4  # 包括前置头部和后置的前一个标签大小
-        
-        # 解析特定类型的标签数据
+        self.total_size = 11 + self.data_size + 4
         self.details = {}
+        self.analysis = {} # For frame drop analysis
+        
         if self.tag_type == FLVTag.AUDIO:
-            self._parse_audio_data()
+            self._parse_audio_data(global_metadata)
         elif self.tag_type == FLVTag.VIDEO:
             self._parse_video_data()
         elif self.tag_type == FLVTag.SCRIPT:
             self._parse_script_data()
-    
-    def _parse_audio_data(self):
-        """解析音频标签数据"""
-        if not self.data:
-            return
-            
+
+    def _parse_audio_data(self, meta: Dict[str, Any]):
+        if not self.data: return
         flags = self.data[0]
-        self.details["Format"] = FLVTag.AUDIO_FORMATS.get(flags >> 4, f"Unknown ({flags >> 4})")
-        self.details["Sample Rate"] = FLVTag.AUDIO_RATES.get((flags >> 2) & 0x3, f"Unknown ({(flags >> 2) & 0x3})")
-        self.details["Sample Size"] = FLVTag.AUDIO_BITS.get((flags >> 1) & 0x1, f"Unknown ({(flags >> 1) & 0x1})")
-        self.details["Channels"] = FLVTag.AUDIO_CHANNELS.get(flags & 0x1, f"Unknown ({flags & 0x1})")
+        sound_format = flags >> 4
+        self.details["Format"] = self.AUDIO_FORMATS.get(sound_format, f"Unknown ({sound_format})")
+        self.details["Sample Size"] = self.AUDIO_BITS.get((flags >> 1) & 0x1, "Unknown")
+
+        if sound_format == 10 and len(self.data) > 1: # AAC
+            aac_packet_type = self.data[1]
+            self.details["AAC Packet Type"] = "AAC sequence header" if aac_packet_type == 0 else "AAC raw"
+            if aac_packet_type == 0 and len(self.data) > 3:
+                try:
+                    reader = BitReader(self.data[2:])
+                    obj_type = reader.read(5)
+                    freq_idx = reader.read(4)
+                    self.details["Audio Object Type"] = AAC_AUDIO_OBJECT_TYPES.get(obj_type, "Unknown")
+                    if freq_idx == 15:
+                        self.details["Sample Rate"] = f"{reader.read(24)} Hz (Explicit from ASC)"
+                    else:
+                        self.details["Sample Rate"] = f"{AAC_SAMPLING_FREQUENCIES.get(freq_idx, 'Unknown')} (from ASC)"
+                    chan_cfg = reader.read(4)
+                    self.details["Channels"] = f"{AAC_CHANNEL_CONFIGURATIONS.get(chan_cfg, 'Unknown')} (from ASC)"
+                    return
+                except Exception as e:
+                    self.details["ASC Parse Error"] = str(e)
+
+        if 'audiosamplerate' in meta:
+            self.details["Sample Rate"] = f"{int(meta['audiosamplerate'])} Hz (from onMetaData)"
+        else:
+            self.details["Sample Rate"] = f"{self.AUDIO_RATES.get((flags >> 2) & 0x3, 'Unknown')} (from Tag Header)"
         
-        # 对于AAC音频，解析AAC包类型
-        if (flags >> 4) == 10:  # AAC
-            if len(self.data) > 1:
-                aac_packet_type = self.data[1]
-                self.details["AAC Packet Type"] = "AAC sequence header" if aac_packet_type == 0 else "AAC raw"
-    
+        if 'stereo' in meta:
+            self.details["Channels"] = "Stereo (from onMetaData)" if meta['stereo'] else "Mono (from onMetaData)"
+        else:
+            self.details["Channels"] = f"{self.AUDIO_CHANNELS.get(flags & 0x1, 'Unknown')} (from Tag Header)"
+
     def _parse_video_data(self):
-        """解析视频标签数据"""
-        if not self.data:
-            return
-            
+        if not self.data: return
         flags = self.data[0]
-        frame_type = (flags >> 4) & 0xF
-        codec_id = flags & 0xF
-        
-        self.details["Frame Type"] = FLVTag.VIDEO_FRAME_TYPES.get(frame_type, f"Unknown ({frame_type})")
-        self.details["Codec ID"] = FLVTag.VIDEO_CODECS.get(codec_id, f"Unknown ({codec_id})")
-        
-        # 对于H.264视频，解析AVC包类型
-        if codec_id == 7:  # AVC (H.264)
-            if len(self.data) > 1:
-                avc_packet_type = self.data[1]
-                if avc_packet_type == 0:
-                    self.details["AVC Packet Type"] = "AVC sequence header"
-                elif avc_packet_type == 1:
-                    self.details["AVC Packet Type"] = "AVC NALU"
-                elif avc_packet_type == 2:
-                    self.details["AVC Packet Type"] = "AVC end of sequence"
-                else:
-                    self.details["AVC Packet Type"] = f"Unknown ({avc_packet_type})"
-    
+        frame_type, codec_id = (flags >> 4) & 0xF, flags & 0xF
+        self.details["Frame Type"] = self.VIDEO_FRAME_TYPES.get(frame_type, f"Unknown ({frame_type})")
+        self.details["Codec ID"] = self.VIDEO_CODECS.get(codec_id, f"Unknown ({codec_id})")
+        if codec_id == 7 and len(self.data) > 4: # AVC
+            avc_packet_type = self.data[1]
+            cts = (self.data[2] << 16) | (self.data[3] << 8) | self.data[4]
+            self.details["AVC Packet Type"] = {0: "Seq. header", 1: "NALU", 2: "End of seq."}.get(avc_packet_type, "Unknown")
+            self.details["CompositionTime Offset"] = f"{cts} ms"
+
     def _parse_script_data(self):
-        """解析脚本数据标签"""
-        if not self.data:
-            return
-            
-        # 简单解析AMF数据，只提取名称
+        if not self.data: return
+        from io import BytesIO
+        f = BytesIO(self.data)
         try:
-            # 跳过AMF类型字节
-            pos = 1
-            # 读取字符串长度
-            name_len = (self.data[pos] << 8) | self.data[pos+1]
-            pos += 2
-            # 读取名称
-            if pos + name_len <= len(self.data):
-                name = self.data[pos:pos+name_len].decode('utf-8', errors='replace')
-                self.details["Name"] = name
-                
-                # 常见的脚本数据名称
-                if name == "onMetaData":
-                    self.details["Type"] = "Metadata"
+            name = _parse_amf_value(f)
+            value = _parse_amf_value(f)
+            self.details["Name"] = name
+            if name == "onMetaData":
+                self.details["Type"] = "Metadata"
+                self.details["Metadata"] = value
+            else:
+                self.details["Value"] = value
         except Exception as e:
             self.details["Parse Error"] = str(e)
-    
-    def get_type_name(self) -> str:
-        """获取标签类型名称"""
-        return FLVTag.TAG_TYPES.get(self.tag_type, f"Unknown ({self.tag_type})")
-    
-    def get_display_info(self) -> Dict[str, Any]:
-        """获取用于显示的标签信息"""
-        return {
-            "Offset": f"0x{self.offset:08X}",
-            "Type": self.get_type_name(),
-            "Size": self.data_size,
-            "Timestamp": f"{self.timestamp} ms",
-            "Details": self.details
-        }
 
+    def get_type_name(self) -> str:
+        return self.TAG_TYPES.get(self.tag_type, f"Unknown ({self.tag_type})")
+
+    def get_display_info(self) -> Dict[str, Any]:
+        info = {"Offset": f"0x{self.offset:08X}", "Type": self.get_type_name(),
+                "Size": self.data_size, "Timestamp": f"{self.timestamp} ms"}
+        if self.analysis:
+            info["Analysis"] = self.analysis
+        info["Details"] = self.details
+        return info
 
 class FLVFile:
-    """FLV文件解析类"""
-    
     def __init__(self, file_path: str):
-        """初始化FLV文件解析器
-        
-        Args:
-            file_path: FLV文件路径
-        """
         self.file_path = file_path
         self.file_name = os.path.basename(file_path)
-        self.header = {}
-        self.tags = []
+        self.header, self.tags, self.metadata = {}, [], {}
         self._parse()
-    
+        self._analyze_tags()
+
     def _parse(self):
-        """解析FLV文件"""
         with open(self.file_path, 'rb') as f:
-            # 解析文件头
             header_data = f.read(9)
-            if len(header_data) < 9:
-                raise ValueError("Invalid FLV file: header too short")
-                
-            # 检查FLV签名
-            if header_data[0:3] != b'FLV':
-                raise ValueError("Invalid FLV file: signature mismatch")
-                
+            if len(header_data) < 9 or header_data[0:3] != b'FLV':
+                raise ValueError("Invalid FLV file")
             self.header["Version"] = header_data[3]
             flags = header_data[4]
-            self.header["HasVideo"] = bool(flags & 0x1)
-            self.header["HasAudio"] = bool(flags & 0x4)
+            self.header["HasVideo"], self.header["HasAudio"] = bool(flags & 1), bool(flags & 4)
             self.header["HeaderSize"] = struct.unpack(">I", header_data[5:9])[0]
-            
-            # 跳过前一个标签大小字段（通常为0）
+            f.seek(self.header["HeaderSize"])
             f.read(4)
             
-            # 解析标签
-            offset = 13  # 文件头(9) + 前一个标签大小(4)
+            temp_offset = self.header["HeaderSize"] + 4
             while True:
-                # 读取标签头
                 tag_header = f.read(11)
-                if len(tag_header) < 11:
-                    break  # 文件结束
-                    
-                # 读取标签数据大小
+                if len(tag_header) < 11: break
+                tag_type = tag_header[0]
                 data_size = (tag_header[1] << 16) | (tag_header[2] << 8) | tag_header[3]
-                
-                # 读取完整标签数据
-                tag_data = tag_header + f.read(data_size)
-                
-                # 创建标签对象
-                tag = FLVTag(offset, tag_data)
-                self.tags.append(tag)
-                
-                # 跳过前一个标签大小字段
-                f.read(4)
-                
-                # 更新偏移量
-                offset += tag.total_size
-    
-    def get_header_info(self) -> Dict[str, Any]:
-        """获取文件头信息"""
-        return {
-            "File": self.file_name,
-            "Version": self.header.get("Version", "Unknown"),
-            "Has Video": self.header.get("HasVideo", False),
-            "Has Audio": self.header.get("HasAudio", False),
-            "Header Size": self.header.get("HeaderSize", 0)
-        }
-    
-    def get_tags(self) -> List[FLVTag]:
-        """获取所有标签"""
-        return self.tags
-    
-    def get_tag_count(self) -> Dict[str, int]:
-        """获取各类型标签的数量统计"""
-        counts = {"Total": len(self.tags)}
-        type_counts = {}
-        
-        for tag in self.tags:
-            tag_type = tag.get_type_name()
-            type_counts[tag_type] = type_counts.get(tag_type, 0) + 1
-            
-        counts.update(type_counts)
-        return counts
+                if tag_type == FLVTag.SCRIPT:
+                    tag_data = tag_header + f.read(data_size)
+                    tag = FLVTag(temp_offset, tag_data, {})
+                    if tag.details.get("Name") == "onMetaData":
+                        self.metadata = tag.details.get("Metadata", {})
+                        break
+                else:
+                    f.seek(data_size + 4, 1)
+                temp_offset += 11 + data_size + 4
 
+            f.seek(self.header["HeaderSize"] + 4)
+            offset = self.header["HeaderSize"] + 4
+            while True:
+                tag_header = f.read(11)
+                if len(tag_header) < 11: break
+                data_size = (tag_header[1] << 16) | (tag_header[2] << 8) | tag_header[3]
+                tag_data = tag_header + f.read(data_size)
+                self.tags.append(FLVTag(offset, tag_data, self.metadata))
+                f.read(4)
+                offset += 11 + data_size + 4
+
+    def _analyze_tags(self):
+        framerate = self.metadata.get('framerate')
+        if framerate and framerate > 0:
+            video_tags = [t for t in self.tags if t.tag_type == FLVTag.VIDEO]
+            expected_interval = 1000 / framerate
+            threshold = expected_interval * 2
+            for i in range(1, len(video_tags)):
+                prev_tag, curr_tag = video_tags[i-1], video_tags[i]
+                gap = curr_tag.timestamp - prev_tag.timestamp
+                if gap > threshold:
+                    dropped_frames = round(gap / expected_interval) - 1
+                    curr_tag.analysis['Warning'] = f"视频时间戳跳跃 {gap}ms (预期值 ~{expected_interval:.1f}ms)，可能丢失 {dropped_frames} 帧。"
+                    curr_tag.analysis['Reason'] = "可能原因：推流端性能不足、网络抖动丢包、编码器延迟。"
+
+        audio_tags = [t for t in self.tags if t.tag_type == FLVTag.AUDIO]
+        if len(audio_tags) > 10:
+            gaps = [audio_tags[i].timestamp - audio_tags[i-1].timestamp for i in range(1, len(audio_tags))]
+            common_gap = Counter(g for g in gaps if g > 0).most_common(1)
+            if common_gap:
+                expected_interval = common_gap[0][0]
+                threshold = expected_interval * 2.5
+                for i in range(1, len(audio_tags)):
+                    prev_tag, curr_tag = audio_tags[i-1], audio_tags[i]
+                    gap = curr_tag.timestamp - prev_tag.timestamp
+                    if gap > threshold:
+                        dropped_packets = round(gap / expected_interval) - 1
+                        curr_tag.analysis['Warning'] = f"音频时间戳跳跃 {gap}ms (预期值 ~{expected_interval}ms)，可能丢失 {dropped_packets} 个音频包。"
+                        curr_tag.analysis['Reason'] = "可能原因：推流端音频采集问题、网络抖动、服务器处理延迟。"
+
+    def get_header_info(self) -> Dict[str, Any]:
+        return {"File": self.file_name, **self.header}
 
 class FLVParserGUI:
-    """FLV解析器GUI界面"""
-    
     def __init__(self, root):
-        """初始化GUI界面
-        
-        Args:
-            root: tkinter根窗口
-        """
         self.root = root
-        self.root.title("FLV文件解析器")
-        self.root.geometry("1000x700")
-        
+        self.root.title("FLV文件解析与工具集")
+        self.root.geometry("1200x800")
         self.flv_file = None
-        self.search_results = []
-        self.current_search_index = -1
-        
         self._create_widgets()
         self._setup_layout()
-    
+
     def _create_widgets(self):
-        """创建GUI组件"""
-        # 创建菜单栏
         self.menu_bar = tk.Menu(self.root)
         self.root.config(menu=self.menu_bar)
-        
-        # 文件菜单
-        self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.file_menu.add_command(label="打开FLV文件", command=self._open_file)
-        self.file_menu.add_separator()
-        self.file_menu.add_command(label="退出", command=self.root.quit)
-        self.menu_bar.add_cascade(label="文件", menu=self.file_menu)
-        
-        # 帮助菜单
-        self.help_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.help_menu.add_command(label="关于", command=self._show_about)
-        self.menu_bar.add_cascade(label="帮助", menu=self.help_menu)
-        
-        # 工具栏框架
+        file_menu = tk.Menu(self.menu_bar, tearoff=0)
+        file_menu.add_command(label="打开FLV文件", command=self._open_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="退出", command=self.root.quit)
+        self.menu_bar.add_cascade(label="文件", menu=file_menu)
+
         self.toolbar_frame = ttk.Frame(self.root)
-        
-        # 打开文件按钮
         self.open_button = ttk.Button(self.toolbar_frame, text="打开FLV文件", command=self._open_file)
+        self.report_button = ttk.Button(self.toolbar_frame, text="丢帧分析报告", command=self._show_analysis_report, state=tk.DISABLED)
+        self.extract_button = ttk.Button(self.toolbar_frame, text="分离音视频", command=self._extract_streams, state=tk.DISABLED)
         
-        # 搜索框架
-        self.search_frame = ttk.Frame(self.toolbar_frame)
-        self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(self.search_frame, textvariable=self.search_var, width=30)
-        self.search_entry.bind("<Return>", self._search)
-        
-        self.search_button = ttk.Button(self.search_frame, text="搜索", command=self._search)
-        self.prev_button = ttk.Button(self.search_frame, text="上一个", command=self._prev_search_result)
-        self.next_button = ttk.Button(self.search_frame, text="下一个", command=self._next_search_result)
-        
-        # 状态栏
-        self.status_var = tk.StringVar()
-        self.status_var.set("准备就绪")
-        self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        
-        # 主分隔窗口
         self.main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         
-        # 左侧信息面板
-        self.info_frame = ttk.Frame(self.main_paned)
-        
-        # 文件信息标签框架
-        self.file_info_labelframe = ttk.LabelFrame(self.info_frame, text="文件信息")
-        self.file_info_text = tk.Text(self.file_info_labelframe, wrap=tk.WORD, width=30, height=8, state=tk.DISABLED)
-        
-        # 标签统计标签框架
-        self.tag_stats_labelframe = ttk.LabelFrame(self.info_frame, text="标签统计")
-        self.tag_stats_text = tk.Text(self.tag_stats_labelframe, wrap=tk.WORD, width=30, height=10, state=tk.DISABLED)
-        
-        # 右侧标签树形视图
         self.tree_frame = ttk.Frame(self.main_paned)
-        
-        # 创建树形视图
         self.tree = ttk.Treeview(self.tree_frame, selectmode=tk.BROWSE)
         self.tree.heading("#0", text="FLV结构", anchor=tk.W)
-        
-        # 树形视图滚动条
+        self.tree.tag_configure('warning', foreground='red')
         self.tree_scrollbar_y = ttk.Scrollbar(self.tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=self.tree_scrollbar_y.set)
         
-        self.tree_scrollbar_x = ttk.Scrollbar(self.tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(xscrollcommand=self.tree_scrollbar_x.set)
+        self.right_pane = ttk.PanedWindow(self.main_paned, orient=tk.VERTICAL)
+        self.info_frame = ttk.Frame(self.right_pane)
+        self.file_info_labelframe = ttk.LabelFrame(self.info_frame, text="文件信息")
+        self.file_info_text = tk.Text(self.file_info_labelframe, wrap=tk.WORD, height=10, state=tk.DISABLED)
+        self.file_info_text.bind("<Key>", lambda e: "break") # Make read-only but allow copy
         
-        # 标签详情面板
-        self.details_labelframe = ttk.LabelFrame(self.root, text="标签详情")
+        self.details_frame = ttk.Frame(self.right_pane)
+        self.details_labelframe = ttk.LabelFrame(self.details_frame, text="标签详情")
         self.details_text = tk.Text(self.details_labelframe, wrap=tk.WORD, state=tk.DISABLED)
-        self.details_scrollbar = ttk.Scrollbar(self.details_labelframe, orient=tk.VERTICAL, command=self.details_text.yview)
-        self.details_text.configure(yscrollcommand=self.details_scrollbar.set)
+        self.copy_button = ttk.Button(self.details_labelframe, text="复制详情", command=self._copy_details)
         
-        # 绑定树形视图选择事件
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
-    
+
     def _setup_layout(self):
-        """设置组件布局"""
-        # 工具栏布局
         self.toolbar_frame.pack(fill=tk.X, padx=5, pady=5)
         self.open_button.pack(side=tk.LEFT, padx=5)
+        self.report_button.pack(side=tk.LEFT, padx=5)
+        self.extract_button.pack(side=tk.LEFT, padx=5)
         
-        self.search_frame.pack(side=tk.RIGHT, padx=5)
-        self.search_entry.pack(side=tk.LEFT, padx=2)
-        self.search_button.pack(side=tk.LEFT, padx=2)
-        self.prev_button.pack(side=tk.LEFT, padx=2)
-        self.next_button.pack(side=tk.LEFT, padx=2)
-        
-        # 主分隔窗口布局
         self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # 左侧信息面板布局
-        self.main_paned.add(self.info_frame, weight=1)
+        self.main_paned.add(self.tree_frame, weight=2)
+        self.tree_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(fill=tk.BOTH, expand=True)
         
+        self.main_paned.add(self.right_pane, weight=3)
+        self.right_pane.add(self.info_frame, weight=1)
         self.file_info_labelframe.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.file_info_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        self.tag_stats_labelframe.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.tag_stats_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 右侧树形视图布局
-        self.main_paned.add(self.tree_frame, weight=3)
-        
-        self.tree_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # 标签详情面板布局
+        self.right_pane.add(self.details_frame, weight=3)
         self.details_labelframe.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.details_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.details_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # 状态栏布局
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-    
+        self.copy_button.pack(side=tk.RIGHT, anchor=tk.SE, padx=5, pady=5)
+        self.details_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
     def _open_file(self):
-        """打开FLV文件"""
-        file_path = filedialog.askopenfilename(
-            title="选择FLV文件",
-            filetypes=[("FLV文件", "*.flv"), ("所有文件", "*.*")]
-        )
-        
-        if not file_path:
-            return
-            
+        file_path = filedialog.askopenfilename(title="选择FLV文件", filetypes=[("FLV文件", "*.flv")])
+        if not file_path: return
         try:
-            self.status_var.set(f"正在解析文件: {file_path}")
-            self.root.update_idletasks()
-            
-            # 解析FLV文件
             self.flv_file = FLVFile(file_path)
-            
-            # 更新界面
             self._update_file_info()
-            self._update_tag_stats()
             self._populate_tree()
-            
-            self.status_var.set(f"文件已加载: {file_path}")
+            self.report_button.config(state=tk.NORMAL)
+            self.extract_button.config(state=tk.NORMAL)
         except Exception as e:
-            messagebox.showerror("错误", f"解析文件时出错: {str(e)}")
-            self.status_var.set("文件解析失败")
-    
+            messagebox.showerror("错误", f"解析文件时出错: {e}")
+            self.report_button.config(state=tk.DISABLED)
+            self.extract_button.config(state=tk.DISABLED)
+
     def _update_file_info(self):
-        """更新文件信息显示"""
-        if not self.flv_file:
-            return
-            
-        # 获取文件头信息
-        header_info = self.flv_file.get_header_info()
-        
-        # 更新文件信息文本
         self.file_info_text.config(state=tk.NORMAL)
         self.file_info_text.delete(1.0, tk.END)
         
-        for key, value in header_info.items():
+        # --- Basic FLV Header Info ---
+        info = self.flv_file.get_header_info()
+        self.file_info_text.insert(tk.END, "--- FLV 基础信息 ---\n")
+        for key, value in info.items():
             self.file_info_text.insert(tk.END, f"{key}: {value}\n")
+
+        # --- File System Info ---
+        try:
+            stat = os.stat(self.flv_file.file_path)
+            size_mb = stat.st_size / (1024 * 1024)
+            creation_time = datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+            modification_time = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
             
+            self.file_info_text.insert(tk.END, "\n--- 文件系统信息 ---\n")
+            self.file_info_text.insert(tk.END, f"文件大小: {size_mb:.2f} MB\n")
+            self.file_info_text.insert(tk.END, f"创建时间: {creation_time}\n")
+            self.file_info_text.insert(tk.END, f"修改时间: {modification_time}\n")
+        except Exception:
+            pass # Ignore if file stat fails
+
+        # --- Media Duration from Metadata ---
+        duration = self.flv_file.metadata.get('duration')
+        if duration:
+            minutes, seconds = divmod(duration, 60)
+            self.file_info_text.insert(tk.END, "\n--- 媒体信息 ---\n")
+            self.file_info_text.insert(tk.END, f"媒体时长: {int(minutes):02d}:{seconds:05.2f}\n")
+
         self.file_info_text.config(state=tk.DISABLED)
-    
-    def _update_tag_stats(self):
-        """更新标签统计信息"""
-        if not self.flv_file:
-            return
-            
-        # 获取标签统计信息
-        tag_counts = self.flv_file.get_tag_count()
-        
-        # 更新标签统计文本
-        self.tag_stats_text.config(state=tk.NORMAL)
-        self.tag_stats_text.delete(1.0, tk.END)
-        
-        for key, value in tag_counts.items():
-            self.tag_stats_text.insert(tk.END, f"{key}: {value}\n")
-            
-        self.tag_stats_text.config(state=tk.DISABLED)
-    
+
     def _populate_tree(self):
-        """填充树形视图"""
-        if not self.flv_file:
-            return
-            
-        # 清空树形视图
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-            
-        # 添加文件头节点
-        header_node = self.tree.insert("", tk.END, text="FLV Header", values=("header",))
-        
-        # 添加文件头详情
-        header_info = self.flv_file.get_header_info()
-        for key, value in header_info.items():
+        for item in self.tree.get_children(): self.tree.delete(item)
+        header_node = self.tree.insert("", tk.END, text="FLV Header", open=True)
+        for key, value in self.flv_file.get_header_info().items():
             self.tree.insert(header_node, tk.END, text=f"{key}: {value}")
-            
-        # 添加标签节点
-        tags_node = self.tree.insert("", tk.END, text="FLV Tags", values=("tags",))
         
-        # 添加各个标签
-        for i, tag in enumerate(self.flv_file.get_tags()):
-            tag_info = tag.get_display_info()
-            tag_node = self.tree.insert(
-                tags_node, 
-                tk.END, 
-                text=f"Tag {i+1}: {tag_info['Type']} @ {tag_info['Timestamp']}",
-                values=("tag", i)
-            )
+        tags_node = self.tree.insert("", tk.END, text="FLV Tags", open=True)
+        for i, tag in enumerate(self.flv_file.tags):
+            info = tag.get_display_info()
+            tag_style = ('warning',) if 'Analysis' in info else ()
+            tag_node = self.tree.insert(tags_node, tk.END, text=f"Tag {i+1}: {info['Type']} @ {info['Timestamp']}", values=("tag", i), tags=tag_style)
             
-            # 添加标签基本信息
-            for key in ["Offset", "Size", "Timestamp"]:
-                self.tree.insert(tag_node, tk.END, text=f"{key}: {tag_info[key]}")
-                
-            # 添加标签详情
-            if tag_info["Details"]:
+            if info.get("Analysis"):
+                self.tree.insert(tag_node, tk.END, text=f"Analysis: {info['Analysis']['Warning']}", tags=('warning',))
+            
+            self.tree.insert(tag_node, tk.END, text=f"Offset: {info['Offset']}")
+            self.tree.insert(tag_node, tk.END, text=f"Size: {info['Size']}")
+            
+            if info["Details"]:
                 details_node = self.tree.insert(tag_node, tk.END, text="Details")
-                for key, value in tag_info["Details"].items():
-                    self.tree.insert(details_node, tk.END, text=f"{key}: {value}")
-        
-        # 展开根节点
-        self.tree.item(header_node, open=True)
-        self.tree.item(tags_node, open=True)
-    
+                self._populate_details_tree(details_node, info["Details"])
+
+    def _populate_details_tree(self, parent, details):
+        for key, value in details.items():
+            if isinstance(value, dict):
+                node = self.tree.insert(parent, tk.END, text=str(key))
+                self._populate_details_tree(node, value)
+            else:
+                self.tree.insert(parent, tk.END, text=f"{key}: {value}")
+
     def _on_tree_select(self, event):
-        """处理树形视图选择事件"""
         selected_item = self.tree.selection()
-        if not selected_item:
-            return
-            
-        item_id = selected_item[0]
-        item_values = self.tree.item(item_id, "values")
-        
-        # 清空详情文本
+        if not selected_item: return
+        item_values = self.tree.item(selected_item[0], "values")
         self.details_text.config(state=tk.NORMAL)
         self.details_text.delete(1.0, tk.END)
-        
         if len(item_values) >= 2 and item_values[0] == "tag":
-            # 显示标签详情
             tag_index = int(item_values[1])
-            if 0 <= tag_index < len(self.flv_file.get_tags()):
-                tag = self.flv_file.get_tags()[tag_index]
-                tag_info = tag.get_display_info()
-                
-                # 添加基本信息
-                self.details_text.insert(tk.END, f"标签类型: {tag_info['Type']}\n")
-                self.details_text.insert(tk.END, f"文件偏移: {tag_info['Offset']}\n")
-                self.details_text.insert(tk.END, f"数据大小: {tag_info['Size']} 字节\n")
-                self.details_text.insert(tk.END, f"时间戳: {tag_info['Timestamp']}\n\n")
-                
-                # 添加详细信息
-                if tag_info["Details"]:
-                    self.details_text.insert(tk.END, "详细信息:\n")
-                    for key, value in tag_info["Details"].items():
-                        self.details_text.insert(tk.END, f"  {key}: {value}\n")
-                        
-                # 添加十六进制数据预览
-                if tag.data:
-                    self.details_text.insert(tk.END, "\n数据预览 (十六进制):\n")
-                    
-                    # 每行显示16个字节
-                    for i in range(0, min(len(tag.data), 160), 16):
-                        # 十六进制部分
-                        hex_part = ""
-                        for j in range(16):
-                            if i + j < len(tag.data):
-                                hex_part += f"{tag.data[i+j]:02X} "
-                            else:
-                                hex_part += "   "
-                                
-                        # ASCII部分
-                        ascii_part = ""
-                        for j in range(16):
-                            if i + j < len(tag.data):
-                                if 32 <= tag.data[i+j] <= 126:  # 可打印ASCII字符
-                                    ascii_part += chr(tag.data[i+j])
-                                else:
-                                    ascii_part += "."
-                            else:
-                                ascii_part += " "
-                                
-                        self.details_text.insert(tk.END, f"  {i:04X}: {hex_part} | {ascii_part}\n")
-                        
-                    if len(tag.data) > 160:
-                        self.details_text.insert(tk.END, "  ...（数据过长，仅显示前160字节）\n")
-        
+            tag = self.flv_file.tags[tag_index]
+            self._format_details_text(tag.get_display_info())
         self.details_text.config(state=tk.DISABLED)
-    
-    def _search(self, event=None):
-        """搜索标签"""
-        search_text = self.search_var.get().strip().lower()
-        if not search_text or not self.flv_file:
-            return
-            
-        # 重置搜索结果
-        self.search_results = []
-        self.current_search_index = -1
-        
-        # 搜索所有标签
-        for i, tag in enumerate(self.flv_file.get_tags()):
-            tag_info = tag.get_display_info()
-            
-            # 检查标签类型
-            if search_text in tag_info["Type"].lower():
-                self.search_results.append(i)
-                continue
-                
-            # 检查详情
-            for key, value in tag_info["Details"].items():
-                if search_text in str(value).lower() or search_text in key.lower():
-                    self.search_results.append(i)
-                    break
-        
-        # 更新状态栏
-        if self.search_results:
-            self.status_var.set(f"找到 {len(self.search_results)} 个匹配项")
-            self._next_search_result()
-        else:
-            self.status_var.set(f"未找到匹配项: {search_text}")
-    
-    def _next_search_result(self):
-        """跳转到下一个搜索结果"""
-        if not self.search_results:
-            return
-            
-        self.current_search_index = (self.current_search_index + 1) % len(self.search_results)
-        self._highlight_search_result()
-    
-    def _prev_search_result(self):
-        """跳转到上一个搜索结果"""
-        if not self.search_results:
-            return
-            
-        self.current_search_index = (self.current_search_index - 1) % len(self.search_results)
-        self._highlight_search_result()
-    
-    def _highlight_search_result(self):
-        """高亮显示当前搜索结果"""
-        if not self.search_results or self.current_search_index < 0:
-            return
-            
-        # 获取标签索引
-        tag_index = self.search_results[self.current_search_index]
-        
-        # 查找对应的树节点
-        tags_node = None
-        for item in self.tree.get_children():
-            if self.tree.item(item, "values") and self.tree.item(item, "values")[0] == "tags":
-                tags_node = item
-                break
-                
-        if not tags_node:
-            return
-            
-        # 查找标签节点
-        tag_node = None
-        for item in self.tree.get_children(tags_node):
-            item_values = self.tree.item(item, "values")
-            if len(item_values) >= 2 and item_values[0] == "tag" and int(item_values[1]) == tag_index:
-                tag_node = item
-                break
-                
-        if not tag_node:
-            return
-            
-        # 展开并选择节点
-        self.tree.see(tag_node)
-        self.tree.selection_set(tag_node)
-        
-        # 更新状态栏
-        self.status_var.set(f"搜索结果 {self.current_search_index + 1}/{len(self.search_results)}")
-    
-    def _show_about(self):
-        """显示关于对话框"""
-        messagebox.showinfo(
-            "关于FLV解析器",
-            "FLV文件解析与可视化工具\n\n"
-            "这个工具可以解析FLV文件格式，并以树形结构显示文件内容。\n"
-            "支持查看标签详情、搜索特定标签等功能。"
-        )
 
+    def _format_details_text(self, details, indent=0):
+        prefix = "  " * indent
+        for key, value in details.items():
+            if isinstance(value, dict):
+                self.details_text.insert(tk.END, f"{prefix}{key}:\n")
+                self._format_details_text(value, indent + 1)
+            else:
+                self.details_text.insert(tk.END, f"{prefix}{key}: {value}\n")
+
+    def _copy_details(self):
+        content = self.details_text.get(1.0, tk.END).strip()
+        if content:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            messagebox.showinfo("成功", "标签详情已复制到剪贴板！")
+
+    def _show_analysis_report(self):
+        if not self.flv_file: return
+        
+        report_window = tk.Toplevel(self.root)
+        report_window.title("丢帧分析报告")
+        report_window.geometry("800x600")
+        
+        report_text = tk.Text(report_window, wrap=tk.WORD, font=("Courier", 11))
+        scrollbar = ttk.Scrollbar(report_window, orient=tk.VERTICAL, command=report_text.yview)
+        report_text.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        report_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        meta = self.flv_file.metadata
+        report_text.insert(tk.END, "--- 媒体信息参数 ---\n")
+        meta_table = [
+            ("参数名", "参数值"),("视频宽度", meta.get('width', 'N/A')),("视频高度", meta.get('height', 'N/A')),
+            ("视频帧率", meta.get('framerate', 'N/A')),("视频码率(kbps)", meta.get('videodatarate', 'N/A')),
+            ("视频编码", FLVTag.VIDEO_CODECS.get(meta.get('videocodecid'), 'N/A')),("音频采样率(Hz)", meta.get('audiosamplerate', 'N/A')),
+            ("音频声道", "双声道" if meta.get('stereo') else "单声道"),("音频码率(kbps)", meta.get('audiodatarate', 'N/A')),
+            ("音频编码", FLVTag.AUDIO_FORMATS.get(meta.get('audiocodecid'), 'N/A')),
+        ]
+        
+        col_widths = [max(len(str(item[i])) for item in meta_table) for i in range(2)]
+        header = f"{'参数名':<{col_widths[0]}} | {'参数值':<{col_widths[1]}}\n"
+        separator = "-" * (col_widths[0] + col_widths[1] + 3) + "\n"
+        report_text.insert(tk.END, header)
+        report_text.insert(tk.END, separator)
+        for name, value in meta_table[1:]:
+            report_text.insert(tk.END, f"{str(name):<{col_widths[0]}} | {str(value):<{col_widths[1]}}\n")
+
+        report_text.insert(tk.END, "\n\n--- 时间戳跳跃分析 ---\n")
+        problematic_tags = [ (i, tag) for i, tag in enumerate(self.flv_file.tags) if tag.analysis ]
+        
+        if not problematic_tags:
+            report_text.insert(tk.END, "未检测到明显的时间戳跳跃或丢帧问题。")
+        else:
+            report_text.insert(tk.END, f"检测到 {len(problematic_tags)} 个有问题的标签:\n\n")
+            for i, tag in problematic_tags:
+                info = tag.get_display_info()
+                report_text.insert(tk.END, f"标签 #{i+1} ({info['Type']} @ {info['Timestamp']}):\n")
+                report_text.insert(tk.END, f"  - 警告: {info['Analysis']['Warning']}\n")
+                report_text.insert(tk.END, f"  - 参考: {info['Analysis']['Reason']}\n\n")
+        
+        report_text.config(state=tk.DISABLED)
+
+    def _get_ffmpeg_path(self):
+        """
+        动态获取 ffmpeg 的路径。
+        如果是在 PyInstaller 打包的环境中，则返回相对于 _MEIPASS 的路径。
+        否则，直接返回 'ffmpeg'，依赖系统 PATH。
+        """
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # 在 PyInstaller 打包的应用中
+            base_path = sys._MEIPASS
+            ffmpeg_executable = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
+            return os.path.join(base_path, ffmpeg_executable)
+        else:
+            # 在正常的开发环境中
+            return 'ffmpeg'
+
+    def _check_ffmpeg(self):
+        ffmpeg_path = self._get_ffmpeg_path()
+        try:
+            # 使用获取到的路径执行命令
+            subprocess.run([ffmpeg_path, "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
+
+    def _extract_streams(self):
+        if not self.flv_file: return
+
+        if not self._check_ffmpeg():
+            messagebox.showerror("错误", "未在本机或应用包中找到 FFmpeg。\n请确保已安装 FFmpeg 并将其添加到系统路径，或确保它已随应用正确打包。")
+            return
+
+        save_dir = filedialog.askdirectory(initialdir=os.path.expanduser("~/Desktop"), title="选择保存目录")
+        if not save_dir: return
+
+        ffmpeg_path = self._get_ffmpeg_path()
+        input_file = self.flv_file.file_path
+        base_name = os.path.splitext(self.flv_file.file_name)[0]
+        output_video = os.path.join(save_dir, f"{base_name}_video.mp4")
+        output_audio = os.path.join(save_dir, f"{base_name}_audio.aac")
+
+        try:
+            # 使用获取到的路径执行命令
+            subprocess.run([ffmpeg_path, "-i", input_file, "-c:v", "copy", "-an", "-y", output_video], check=True)
+            subprocess.run([ffmpeg_path, "-i", input_file, "-c:a", "copy", "-vn", "-y", output_audio], check=True)
+            messagebox.showinfo("成功", f"音视频已成功分离到:\n{save_dir}")
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("FFmpeg 错误", f"执行FFmpeg命令时出错:\n{e}")
+        except Exception as e:
+            messagebox.showerror("错误", f"分离文件时出错:\n{e}")
 
 def main():
-    """主函数"""
     root = tk.Tk()
     app = FLVParserGUI(root)
     root.mainloop()
 
-
 if __name__ == "__main__":
     main()
+
+
